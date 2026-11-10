@@ -1,0 +1,40 @@
+# Failure detection. Firing alerts are visible at http://localhost:9090/alerts
+# and on the Grafana dashboard. (No Alertmanager: there is nowhere free to send
+# notifications in a local setup; see docs/runbook.md.)
+groups:
+  - name: ecommerce-api
+    rules:
+      - alert: ApiDown
+        expr: up{job="ecommerce-api"} == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: "API is not reachable by Prometheus"
+          runbook: "docs/runbook.md#api-down"
+
+      - alert: DatabaseUnavailable
+        expr: app_mongodb_up == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: "API has lost its MongoDB connection (/ready returns 503)"
+          runbook: "docs/runbook.md#database-down"
+
+      - alert: HighServerErrorRate
+        expr: |
+          (sum(rate(http_requests_total{status=~"5.."}[5m])) or vector(0))
+            / clamp_min(sum(rate(http_requests_total[5m])), 0.001) > 0.05
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "More than 5% of requests are failing with 5xx"
+          runbook: "docs/runbook.md#high-error-rate"
+
+      - alert: SlowRequests
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m]))) > 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "p95 latency is above 1 second"
+          runbook: "docs/runbook.md#slow-requests"

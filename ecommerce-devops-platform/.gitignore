@@ -1,0 +1,10 @@
+node_modules/
+coverage/
+.env
+*.log
+backups/*
+!backups/.gitkeep
+nginx/certs/*
+!nginx/certs/.gitkeep
+.deploy-history
+docs/evidence/*.tmp

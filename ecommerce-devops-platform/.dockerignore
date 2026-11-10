@@ -1,0 +1,15 @@
+# Only src/, scripts/seed.js, scripts/healthcheck.js and package files are needed in the image.
+node_modules
+coverage
+tests
+docs
+backups
+nginx
+monitoring
+.github
+.git
+.env
+.env.*
+*.md
+Dockerfile
+docker-compose*.yml

@@ -1,0 +1,159 @@
+# Local production-style deployment.  Start:  docker compose up -d --build
+#
+# Networks (least privilege):
+#   edge       nginx <-> app                  (only nginx publishes 80/443)
+#   data       app/seed <-> mongo             (internal: no host or internet access)
+#   monitoring prometheus <-> app, grafana    (UIs bound to 127.0.0.1 only)
+
+name: ecommerce
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }   # bounded logs, no full disk
+
+x-app-build: &app-build
+  context: .
+  args:
+    APP_VERSION: ${APP_IMAGE_TAG:-local}
+    GIT_SHA: ${GIT_SHA:-unknown}
+
+services:
+  mongo:
+    image: mongo:8.0
+    container_name: ecommerce-mongo
+    restart: unless-stopped
+    # Generates a fresh keyfile (required for auth on a replica set), then hands
+    # over to the official entrypoint, which drops root and runs mongod as "mongodb".
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        head -c 756 /dev/urandom | base64 > /tmp/mongo-keyfile
+        chmod 400 /tmp/mongo-keyfile && chown 999:999 /tmp/mongo-keyfile
+        exec docker-entrypoint.sh mongod --replSet rs0 --bind_ip_all --keyFile /tmp/mongo-keyfile
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:?set in .env}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?set in .env}
+      MONGO_APP_DATABASE: ${MONGO_APP_DATABASE:-ecommerce}
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:?set in .env}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:?set in .env}
+      MONGO_BACKUP_USERNAME: ${MONGO_BACKUP_USERNAME:?set in .env}
+      MONGO_BACKUP_PASSWORD: ${MONGO_BACKUP_PASSWORD:?set in .env}
+      MONGO_REPLICA_HOST: mongo:27017
+    volumes:
+      - mongo-data:/data/db
+      - mongo-config:/data/configdb
+      - ./scripts/mongo/init-users.js:/docker-entrypoint-initdb.d/01-init-users.js:ro
+      - ./scripts/mongo:/opt/scripts:ro
+    healthcheck:
+      # $$ = evaluated inside the container, so secrets never appear in compose output.
+      test: ["CMD-SHELL", "mongosh --quiet -u \"$$MONGO_INITDB_ROOT_USERNAME\" -p \"$$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin /opt/scripts/healthcheck.js"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    networks: [data]
+    logging: *logging
+
+  seed:
+    # One-shot job: creates catalogue + admin if missing, then exits 0. Safe to re-run.
+    # Same image as the app (the build is shared via the layer cache).
+    image: ${APP_IMAGE:-ecommerce-api}:${APP_IMAGE_TAG:-local}
+    build: *app-build
+    container_name: ecommerce-seed
+    command: ["node", "scripts/seed.js"]
+    environment:
+      MONGO_URI: mongodb://${MONGO_APP_USERNAME}:${MONGO_APP_PASSWORD}@mongo:27017/${MONGO_APP_DATABASE:-ecommerce}?replicaSet=rs0&authSource=${MONGO_APP_DATABASE:-ecommerce}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:?set in .env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set in .env}
+    depends_on:
+      mongo: { condition: service_healthy }
+    restart: "no"
+    networks: [data]
+    logging: *logging
+
+  app:
+    image: ${APP_IMAGE:-ecommerce-api}:${APP_IMAGE_TAG:-local}
+    build: *app-build
+    container_name: ecommerce-app
+    restart: unless-stopped
+    init: true                     # tiny init as PID 1: forwards SIGTERM, reaps zombies
+    read_only: true                # immutable container filesystem
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      MONGO_URI: mongodb://${MONGO_APP_USERNAME}:${MONGO_APP_PASSWORD}@mongo:27017/${MONGO_APP_DATABASE:-ecommerce}?replicaSet=rs0&authSource=${MONGO_APP_DATABASE:-ecommerce}
+      JWT_SECRET: ${JWT_SECRET:?set in .env}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-1h}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
+    depends_on:
+      mongo: { condition: service_healthy }
+      seed: { condition: service_completed_successfully }
+    networks: [edge, data, monitoring]
+    logging: *logging
+
+  nginx:
+    image: nginxinc/nginx-unprivileged:1.28-alpine   # runs as uid 101, listens on 8080/8443
+    container_name: ecommerce-nginx
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:8080"
+      - "${HTTPS_PORT:-443}:8443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      app: { condition: service_healthy }
+    networks: [edge]
+    logging: *logging
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: ecommerce-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    ports: ["127.0.0.1:9090:9090"]
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    networks: [monitoring]
+    logging: *logging
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    container_name: ecommerce-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    ports: ["127.0.0.1:3001:3000"]
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [prometheus]
+    networks: [monitoring]
+    logging: *logging
+
+networks:
+  edge: {}
+  data: { internal: true }
+  monitoring: {}
+
+volumes:
+  mongo-data:
+  mongo-config:
+  prometheus-data:
+  grafana-data:
