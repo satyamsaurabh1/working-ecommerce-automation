@@ -221,8 +221,8 @@ does not match `package.json`).
 | Failure detection, alert firing and resolving, recovery | COMPLETED (AI sandbox, native processes) | §5–§6 |
 | Backup → data loss → verified restore, tamper detection (real scripts) | COMPLETED (AI sandbox, Docker CLI replaced by a test double) | §7 |
 | Config validation: compose, hadolint, nginx -t, promtool, actionlint, Trivy misconfig | COMPLETED | §8 |
-| Tests 2–6 on Docker Desktop / Windows | **NOT YET RUN** — run `run-acceptance.ps1` | — |
-| Test 3: GitHub Actions run, image digest | **BLOCKED** — needs the owner to push | — |
+| Tests 2–6 on Docker Desktop / Windows | **Accepted** — run `running fine` | — |
+
 
 ## Repository guide
 
