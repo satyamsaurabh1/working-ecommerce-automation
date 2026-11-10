@@ -1,6 +1,6 @@
 # E-Commerce Platform — Cloud Deployment & CI/CD
 
-DevOps & Cloud Engineering internship assessment for **ALGIONS AI LABS PRIVATE LIMITED**.
+DevOps & Cloud Engineering internship assessment.
 
 A small **Product and Order API** (Node.js, Express, MongoDB) delivered with a
 production-style DevOps toolchain: reproducible container builds, a CI/CD pipeline,
