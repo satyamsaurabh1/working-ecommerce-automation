@@ -34,6 +34,10 @@ jobs:
     name: Lint, audit and test
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ecommerce-devops-platform
+
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
@@ -41,6 +45,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
+          cache-dependency-path: ecommerce-devops-platform/package-lock.json
 
       - name: Install exact dependencies from the lockfile
         run: npm ci
