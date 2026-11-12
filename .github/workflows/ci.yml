@@ -73,7 +73,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage
-          path: coverage/
+          path: ecommerce-devops-platform/coverage/
           retention-days: 7
 
   build:
@@ -84,6 +84,9 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       short_sha: ${{ steps.version.outputs.short_sha }}
+    defaults:
+      run:
+        working-directory: ecommerce-devops-platform
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
@@ -140,14 +143,14 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: image
-          path: image.tar.gz
+          path: ecommerce-devops-platform/image.tar.gz
           retention-days: 7
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: trivy-reports
-          path: reports/
+          path: ecommerce-devops-platform/reports/
           retention-days: 30
 
       - name: Job summary
@@ -166,6 +169,9 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: ecommerce-devops-platform
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
@@ -211,7 +217,7 @@ jobs:
         if: always()
         with:
           name: acceptance-evidence
-          path: docs/evidence/
+          path: ecommerce-devops-platform/docs/evidence/
           retention-days: 30
 
       - name: Tear down
