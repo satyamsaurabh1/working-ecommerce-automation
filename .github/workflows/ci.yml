@@ -1,0 +1,255 @@
+# CI/CD pipeline
+#
+#   quality  -> lint, dependency audit, 60 automated tests with coverage
+#   build    -> versioned Docker image, Trivy image + config scan (gate), image saved as artifact
+#   e2e      -> fresh runner: full stack via Docker Compose, acceptance tests 1, 4, 5, 6 (+ rollback)
+#   publish  -> push to GitHub Container Registry (main branch and v* tags only)
+#
+# Supply chain: every third-party action is pinned to a full commit SHA (tags can be
+# moved; SHAs cannot). The workflow token is read-only except where a job needs more.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ecommerce-api
+  TRIVY_IMAGE: aquasec/trivy:0.76.0
+  NODE_VERSION: "22"
+
+jobs:
+  quality:
+    name: Lint, audit and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install exact dependencies from the lockfile
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Audit production dependencies (fails on high/critical)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Audit all dependencies (report only)
+        run: npm audit || true
+
+      - name: Cache the MongoDB binary used by the tests
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ~/.cache/mongodb-binaries
+          key: mongodb-binaries-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Run tests with coverage (real MongoDB replica set)
+        run: npm run test:coverage -- --ci
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 7
+
+  build:
+    name: Build, tag and scan image
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Compute version
+        id: version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $version"; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Build image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: |
+            ${{ env.IMAGE_NAME }}:ci
+            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-${{ steps.version.outputs.short_sha }}
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.version }}-${{ steps.version.outputs.short_sha }}
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify the image runs as non-root
+        run: |
+          user=$(docker image inspect --format '{{.Config.User}}' "$IMAGE_NAME:ci")
+          echo "Image user: $user"
+          [[ -n "$user" && "$user" != "root" && "$user" != "0" && "$user" != 0:* ]]
+
+      - name: Trivy image scan (fails on fixable HIGH/CRITICAL)
+        run: |
+          mkdir -p reports
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/reports:/reports" "$TRIVY_IMAGE" \
+            image --format json --output /reports/trivy-image.json "$IMAGE_NAME:ci"
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" \
+            image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$IMAGE_NAME:ci"
+
+      - name: Trivy repository scan (secrets and Dockerfile/Compose misconfiguration)
+        run: |
+          docker run --rm -v "$PWD:/src:ro" "$TRIVY_IMAGE" \
+            fs --scanners secret,misconfig --severity HIGH,CRITICAL --exit-code 1 /src
+
+      - name: Save image as a build artifact
+        run: docker save "$IMAGE_NAME:ci" | gzip > image.tar.gz
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: image
+          path: image.tar.gz
+          retention-days: 7
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: trivy-reports
+          path: reports/
+          retention-days: 30
+
+      - name: Job summary
+        run: |
+          {
+            echo "### Image built"
+            echo "| | |"; echo "|---|---|"
+            echo "| Version | \`${{ steps.version.outputs.version }}\` |"
+            echo "| Tags | \`${{ steps.version.outputs.version }}\`, \`${{ steps.version.outputs.version }}-${{ steps.version.outputs.short_sha }}\` |"
+            echo "| Image ID | \`$(docker image inspect --format '{{.Id}}' "$IMAGE_NAME:ci")\` |"
+            echo "| Size | $(docker image inspect --format '{{.Size}}' "$IMAGE_NAME:ci" | numfmt --to=iec) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  e2e:
+    name: End-to-end acceptance on a clean environment
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: image
+
+      - name: Load the exact image that was built and scanned
+        run: gunzip -c image.tar.gz | docker load
+
+      - name: Configure (same documented commands as on Windows)
+        shell: pwsh
+        run: |
+          ./scripts/init-env.ps1
+          ./scripts/generate-certs.ps1
+          Import-Module ./scripts/lib/common.psm1
+          Set-EnvValue APP_IMAGE_TAG ci
+
+      - name: Start the stack
+        run: docker compose up -d --no-build
+
+      - name: Wait for readiness through Nginx
+        shell: pwsh
+        run: |
+          Import-Module ./scripts/lib/common.psm1
+          if (-not (Wait-HttpStatus 'https://localhost/ready' 200 180)) { docker compose ps; exit 1 }
+          docker compose ps
+
+      - name: Acceptance tests 1, 4, 5, 6 + rollback
+        shell: pwsh
+        run: ./scripts/run-acceptance.ps1 -IncludeRollback
+
+      - name: Service logs (on failure)
+        if: failure()
+        run: docker compose logs --no-color --tail 200
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: acceptance-evidence
+          path: docs/evidence/
+          retention-days: 30
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  publish:
+    name: Publish to GitHub Container Registry
+    needs: [build, e2e]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write   # the only job allowed to write packages
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: image
+
+      - run: gunzip -c image.tar.gz | docker load
+
+      - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # built-in token, no stored credentials
+
+      - name: Tag and push
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SHORT_SHA: ${{ needs.build.outputs.short_sha }}
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/$IMAGE_NAME"
+          tags=("$VERSION-$SHORT_SHA" "sha-$SHORT_SHA")
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then tags+=("$VERSION"); fi
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then tags+=("main"); fi
+          for t in "${tags[@]}"; do
+            docker tag "$IMAGE_NAME:ci" "$repo:$t"
+            docker push "$repo:$t"
+          done
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$repo:${tags[0]}")
+          {
+            echo "### Published"
+            for t in "${tags[@]}"; do echo "- \`$repo:$t\`"; done
+            echo ""; echo "Digest: \`$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
